@@ -39,8 +39,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-DEFAULT_THRESHOLD = 700_000    # 按 1M 上下文的模型定：留 30 万余量，一轮里的大工具输出、图片顶不到天花板
-DEFAULT_RETAIN = 300_000       # 续接后留下的尾部；必须小于门槛，否则刚续完又越线
+DEFAULT_THRESHOLD = 600_000    # 按 1M 上下文的模型定：留 40 万余量，一轮里的大工具输出、图片顶不到天花板
+DEFAULT_RETAIN = 200_000       # 续接后留下的尾部；必须小于门槛，否则刚续完又越线
 PRIMER_ROUNDS = 2
 PRIMER_RESULT_CHARS = 200
 
