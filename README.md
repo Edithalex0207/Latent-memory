@@ -152,6 +152,8 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 - **八个 `latent_` 工具**：`latent_session_start`（换窗召回）／`latent_search`／`latent_append`／`latent_supersede`／`latent_correct`／`latent_cleanup`／`latent_unresolved`／`latent_thread_close`。职责一览见[《原理与架构》](docs/原理与架构.md)，参数与回执见[《工具参考》](docs/工具参考.md)。前缀不是装饰：**通用名（`memory_search` 这类）可能跟宿主自带的同名工具撞上**，撞上之后服务照常连着、工具列表照常看得见、模型照常回话，只是调的不是这一份，**全程零报错**。
 - **MCP 协议**：按官方规格 2025-06-18 实现；同时支持本地 stdio 与远程 Streamable HTTP（`--http`＋`--token`）。`--http` 收的是 `[HOST:]PORT`，**省略 HOST 只绑回环、别的机器连不到**；绑非回环时是裸 HTTP，推荐绑回环、公网那一跳交给反代管 TLS。服务端按客户端的 `Accept` 给 JSON 或单事件 SSE，GET 给一条只发心跳的空长流；被拒的请求在服务端留一行（状态码、方法、路径、来源 IP、原因，不含 token 与请求体）。细节见《快速上手》部署形态二与《故障排查》。
 - **自动浮现（Passive Recall，默认关）**：每轮用户消息之后、模型请求之前，由宿主 hook 把相关的旧事递进本轮输入。它要求宿主能在那个时机执行 hook，并能控制注入内容是否进入对话历史；**“支持 MCP”不等于“支持自动浮现”**。AI 会替你判断宿主有没有这个能力，三项不能全部确认就保持关闭；出问题先关掉，主动检索、换窗召回和写回不受影响。说明见[《自动浮现》](docs/自动浮现.md)，宿主接入见[《自动浮现宿主接入》](docs/自动浮现宿主接入.md)。**不接受把隐藏入口 `latent_passive_recall` 暴露成普通模型工具的改动。**
+- **后台落档（可选）**：聊天一直在同一个会话里进行时，`src/background_archive.py` 在后台隔一阵读一次对话记录（Claude Code 会话 jsonl 或通用 jsonl），攒够了就起一个不带任何工具的一次性模型子进程，把这一段整理成当天的记录、自审一遍，再通过 `latent_append` 写进记忆库；写成功才推进游标，输出不合形状不落盘，连续失败可以推提醒。不靠模型记得“记一下”。说明见[《后台落档》](docs/后台落档.md)。
+- **原地续接（可选）**：上下文快满时，`src/forge_session.py` 把 Claude Code 会话最近一段原样留下（连 thinking 一起），换一个新会话 id 接着跑，不跑摘要；裁之前先落档、再写续接检查点，任一步没成功就不裁。和后台落档、自动浮现一起用，就是一直在一个窗口里聊、不用管记忆。说明见[《原地续接》](docs/原地续接.md)。
 - **山屋（默认关）**：`--http` 下加 `--admin-token <页面钥匙> --ui <仓库目录>/hut`，浏览器打开 `http://127.0.0.1:<端口>/hut/`。页面数据走 `/admin/api`：单独一把钥匙，不许跟 `--token`／`--hook-token` 相同、互不通用；只回同源请求；不进工具表。钥匙只在这台设备的浏览器里存一次。便条存进 `<corpus>/便条.jsonl`；开了 `--admin-token` 的进程（stdio 也认，只开便条）工具表多一个 `latent_note_reply`。
 - **每个文件自带自检**：`python <文件名> --selftest`；正式发布检查在仓库根目录一条命令跑完：`python tests/run_release_checks.py`。没装 jieba 时，自动浮现相关的自检段落会打印“跳过”。macOS 上会有两项因临时目录的路径别名而红（26/28），不是出货问题，见 [`tests/README.md`](tests/README.md)。GitHub Actions（`.github/workflows/release-checks.yml`）在 Python 3.10／3.11／3.12 上先装 jieba 再跑同一判据。`python src/e2e_smoke.py --selftest` 跑完从导入到检索的整条链。
 
@@ -166,6 +168,8 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 | [`docs/注入契约.md`](docs/注入契约.md) | **自己写前端的人**：人格文件怎么拼进请求才立得住（五条判据 ＋ 四个坑）|
 | [`docs/自动浮现.md`](docs/自动浮现.md) | 用户与 AI：是否启用、两种模式、部署报告、回滚和反馈 |
 | [`docs/自动浮现宿主接入.md`](docs/自动浮现宿主接入.md) | AI 与宿主实现者：hook、隐藏入口、生命周期与兼容判据 |
+| [`docs/后台落档.md`](docs/后台落档.md) | 想让对话自动按天落进记忆库、不靠模型自己写回的人 |
+| [`docs/原地续接.md`](docs/原地续接.md) | 自建前端作者：上下文快满时不开新窗、不压缩，原地接着聊 |
 | [`docs/隐私与数据流.md`](docs/隐私与数据流.md) | 想确认什么落盘、什么会离开本机、如何删除的人 |
 | [`docs/升级与迁移.md`](docs/升级与迁移.md) | 从旧 commit／旧配置升级的人 |
 | [`docs/故障排查.md`](docs/故障排查.md) | 服务、客户端、目录、检索或山屋出问题的人 |
