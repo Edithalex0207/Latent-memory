@@ -996,10 +996,19 @@ class MemoryServer:
                  supersessions_path=None, entities_path=None, loader=None, time_context=None,
                  source_dirs=None, index_dir=None, startup_notice=None,
                  require_unresolved_review=False, write_dir=None,
-                 enable_passive_recall=False, recall_per_day_cap=None):
+                 enable_passive_recall=False, recall_per_day_cap=None,
+                 defer_index=False, fact_provider=None):
+        # defer_index：只给 --http 用——先拿一份空索引把握手顶起来，真索引由
+        # start_background_load() 在后台线程建好再换入（任务卡「HTTP 启动先握手后建索引」）。
+        # 此时附属账本（撤回／取代／权重／实体）也留到换入时按新索引接，这里不碰空壳。
+        # fact_provider：事实索引的向量提供方；延后加载时空壳上没有提供方，必须由调用方单独给，
+        # 否则事实模式会不报错地退成无向量。
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
         # 主动问一件事，多给几条值；换窗召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
+        self.loading = bool(defer_index)         # 后台还在建索引：工具调用回“还在建”
+        self.loading_since = time.monotonic() if defer_index else None
+        self.swap_lock = None                    # HTTP 的串行锁；make_http_server 会接上
         self.thread_store = thread_store if thread_store is not None else ThreadStore()
         self.corpus_dir = corpus_dir
         self.passive_metadata = PassiveMetadataStore(
@@ -1037,7 +1046,8 @@ class MemoryServer:
             # 复用主索引的 embedding 提供方。回滚要切回旧版本，只删环境变量关不掉。
             from passive_facts import fact_index_from_env
             fact_index, fact_cooldown = fact_index_from_env(
-                getattr(self.index, "provider", None) if getattr(self.index, "embed", False) else None,
+                fact_provider if fact_provider is not None else
+                (getattr(self.index, "provider", None) if getattr(self.index, "embed", False) else None),
                 default_root=self._default_fact_root())
         self.passive = PassiveRecallService(
             self.index, metadata_reader=self.passive_metadata.read,
@@ -1075,20 +1085,20 @@ class MemoryServer:
         # 撤回账本（错误记忆治理闭环）：配了就启动时载入、每次撤回后落盘——
         # 不落盘的话"改过来了"只活一个进程，跟权重当初同一个坑
         self.retractions_path = retractions_path
-        if retractions_path is not None:
+        if retractions_path is not None and not defer_index:
             self.index.load_retractions(retractions_path)
         # 老部署没有该文件时 load_supersessions 返回 0，全部记录显式视为 current。
         self.supersessions_path = (Path(supersessions_path) if supersessions_path is not None
                                   else (Path(corpus_dir) / ".supersessions.json"
                                         if corpus_dir is not None else None))
-        if self.supersessions_path is not None:
+        if self.supersessions_path is not None and not defer_index:
             self.index.load_supersessions(self.supersessions_path)
-        if weights_path is not None:
+        if weights_path is not None and not defer_index:
             self.index.load_weights(weights_path)
         # 实体标注（图谱可插拔升级）：语料目录下有 .entities.json 就接上——
         # 实体边在 build 时算，接上后要重建一次索引才生效
         self.entities_path = entities_path
-        if entities_path is not None and self.index.load_entities(entities_path):
+        if entities_path is not None and not defer_index and self.index.load_entities(entities_path):
             self.index.build()
         # loader：怎么从盘上重建索引（常驻 HTTP 形态的重读用）。stdio 懒加载
         # 每次调用重读语料所以用不上；不传则常驻形态检测到语料变化时明确不重读
@@ -1144,6 +1154,42 @@ class MemoryServer:
                 "已完成的文件写入或清理不会回滚，请先核对磁盘结果，不要直接重复写入；"
                 "修复文件或资源问题后，下次请求会重试加载。") from None
         self._sync_index_consumers()
+
+    def start_background_load(self, on_error=None):
+        """后台线程建真索引，建好后一次性换入；返回线程（自检要 join）。只给 defer_index 的服务用。
+
+        ⚠ `loader()` 与四个附属账本都在**锁外**、只碰新建的那份索引——放进锁里握手又会被挡住，
+        等于没改。换入那一下才拿 HTTP 的串行锁。加载期间写工具一律被 `_call_tool` 拒掉，
+        所以账本文件在这段时间里不会被我们自己改。
+        失败不崩：`index` 置空、`loading` 放下，之后的请求走既有的“重建失败回 503、下次请求重试”。"""
+        def run():
+            new, failure = None, None
+            try:
+                new = self.loader() if self.loader is not None else load_corpus(self.source_dirs)
+                if self.retractions_path is not None:
+                    new.load_retractions(self.retractions_path)
+                if self.supersessions_path is not None:
+                    new.load_supersessions(self.supersessions_path)
+                if self.weights_path is not None:
+                    new.load_weights(self.weights_path)
+                if self.entities_path is not None and new.load_entities(self.entities_path):
+                    new.build()
+            except Exception as exc:                 # noqa: BLE001（后台线程不许把异常吞成沉默）
+                new, failure = None, exc
+            with (self.swap_lock or threading.Lock()):
+                self.index = new
+                self._sync_index_consumers()
+                self.loading = False
+            if failure is not None and on_error is not None:
+                on_error(failure)
+        t = threading.Thread(target=run, name="latent-index-load", daemon=True)
+        t.start()
+        return t
+
+    def loading_notice(self):
+        seconds = int(time.monotonic() - (self.loading_since or time.monotonic()))
+        return (f"索引还在建（已 {seconds} 秒）：服务刚启动，正在读语料。语料多的机器一般一分钟内好，"
+                "这不是故障，也不是记忆丢了，请稍后再试。")
 
     def _refresh_after_write(self, paths=None):
         """正文写入后更新索引；常驻与测试路径同一语义。
@@ -2412,6 +2458,11 @@ class MemoryServer:
             args = {}
         if not isinstance(args, dict):
             return self._err(mid, E_INVALID_PARAMS, "arguments 必须是对象")
+        if self.loading:
+            # 读写一律先不接：写进盘的新块可能漏出后台加载读语料的那一刻（任务卡判据 3）。
+            # 回正常结果＋isError（不是 503、不挂起），让模型和宿主都看得到原因。
+            return self._ok(mid, {"content": [{"type": "text", "text": self.loading_notice()}],
+                                  "isError": True})
         try:
             if self.index is None:
                 self._reload_from_disk()
@@ -2787,6 +2838,7 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
     if admin_token:
         http_bind_guard("127.0.0.1", admin_token)   # 只借它那道"钥匙必须 ASCII"的检查
     lock = threading.Lock()                  # index 的增删改建都不是线程安全的：串行化
+    server.swap_lock = lock                  # 后台加载建好后换入索引，要排同一个队
     if admin is not None:
         admin.lock = lock                    # 页面口子读索引，跟工具调用排同一个队
     mimetypes.add_type("image/webp", ".webp")
@@ -3040,6 +3092,10 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
                 code, body = admin.handle_post(path[len("/admin/api"):], data)
                 return self._send(code, json.dumps(body, ensure_ascii=False).encode("utf-8"),
                                   extra=[("Cache-Control", "no-store")])
+            if server.loading:
+                return self._send(503, json.dumps({"error": server.loading_notice()},
+                                                  ensure_ascii=False).encode("utf-8"),
+                                  extra=[("Cache-Control", "no-store")])
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             code, body = admin.handle(path[len("/admin/api"):], query)
             self._send(code, json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -3142,7 +3198,9 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
                 # 不可漏掉一次）。
                 # 外部变化（推送器、云端经 git 同步落盘）先防抖、再按文件增量换块（外部同步卡）：
                 # 窗口里照常用当前索引回答；索引是空的（#36 重建失败后）不防抖，立刻重建。
-                if state["sig"] is not None:
+                # 后台还在建索引时不做外部变化同步：指纹是启动时取的，建好后第一个请求自然发现差异、
+                # 走增量；这里要是照常判 `index is None` 会在加载中再整库重建一次（内存峰值叠加）。
+                if state["sig"] is not None and not server.loading:
                     sig = _corpus_signature(server.source_dirs)
                     changed = frozenset(sig) ^ frozenset(state["sig"])
                     now = clock()
@@ -3759,8 +3817,11 @@ def doctor_json(checks):
 # 视角，不是用户的。
 
 # 慢加载提示的两道门槛（秒）。第一道给"是不是卡死了"一个答复，第二道让久等的人
-# 知道进程还活着。⚠ 只提示，**不改加载时序**（任务卡靶心四：改成全异步/懒加载会
+# 知道进程还活着。⚠ stdio 只提示，**不改加载时序**（任务卡靶心四：改成全异步/懒加载会
 # 把可见的慢换成不可见的慢——握手秒回、第一次 latent_search 卡死，更糟）。
+# **--http 例外**：先开端口、后台建索引，建好前工具回明说的“索引还在建”，
+# 所以那条路上第一次 latent_search 不是卡死而是一句人话（任务卡「HTTP启动先握手后建索引」）；
+# 本提示只留给 stdio。
 _SLOW_LOAD_NOTICE_SECONDS = (5.0, 30.0)
 
 # 启动失败报告落盘的目录，可用环境变量顶掉（容器里 HOME 可能不可写）
@@ -3975,8 +4036,9 @@ def slow_load_notice(stream=None, thresholds=_SLOW_LOAD_NOTICE_SECONDS):
     这段时间里进程一声不吭，看起来跟卡死一模一样，客户端只会超时。
 
     ⚠ **这一轮只做到「慢的时候有话说」**（靶心四，防过度纠正）：
-    不把加载改成全异步/懒加载——那样握手秒回、第一次 `latent_search` 卡死，
-    是把可见的慢换成不可见的慢。真要改加载时序另开卡。
+    **stdio** 不把加载改成全异步/懒加载——那样握手秒回、第一次 `latent_search` 卡死，
+    是把可见的慢换成不可见的慢。（**--http 已另开卡改了**：先握手、后台建索引，建好前工具
+    明说“索引还在建”，不卡死；见任务卡「HTTP启动先握手后建索引」。stdio 握手走 stdout，不适用。）
 
     ⚠ **这句话走 stderr，因此在 stdio 形态下用户多半看不到**——这跟降级壳
     （失败路径）不是一回事：第 4 条最终是"加载完了、能起来"，协议流那时才开始，
@@ -4509,6 +4571,184 @@ def _memory_retrieval_hidden_hooks():
     return memory_retrieval._HIDDEN_HOOKS
 
 
+def _selftest_http_deferred_load(now=1_800_000_000.0):
+    """HTTP 启动先握手、后建索引（任务卡「HTTP启动先握手后建索引」第五节，判据 1～9）。
+
+    夹具：进程内、真端口；假 loader 读完语料后停在 `threading.Event` 上，由测试手动放行，
+    所以“加载中”是确定的状态，不靠时长。语料 3 个小 md＋假向量提供方（--embed 档）。
+    采集条件：假 loader 靠 Event 控制、不睡眠；Python 版本与平台见下面最后一行输出。
+    判据 1 握手不等索引（initialize＋tools/list；`ping` 服务端本来就没实现、回未知 method，见卡里第五节注）；2 读工具明说；3 写工具拒绝且零写入；4 放行后恢复；5 只建一份；
+    6 加载中改语料不丢；7 事实提供方构造期就有、与主索引一致；8 加载失败（MemoryServer 层）；
+    9 页面口子回“还在建”。判据 8 的进程层、判据 10 不退化由既有自检守着。
+    变异：后台加载改回同步 → 1 红；去掉 loading 时的拒绝 → 2、3 红；loader 放进锁里 → 1 红；
+    事实提供方仍取自主索引 → 7 红。"""
+    import platform
+    import tempfile
+    import urllib.error
+    import urllib.request
+    from embedding_provider import EmbeddingProvider
+
+    class FakeProvider(EmbeddingProvider):
+        kind = "fake"
+
+        def __init__(self):
+            super().__init__("selftest-8d")
+
+        def _embed_raw(self, texts):
+            return [[(hashlib.sha1(f"{t}|{i}".encode()).digest()[0] / 255.0) + 0.01
+                     for i in range(8)] for t in texts]
+
+        def describe(self):
+            return "selftest"
+
+    sec = lambda title, body: f"## {title}\n{body}\n"
+    env_keys = ("LATENT_PASSIVE_FACTS", "LATENT_PASSIVE_FACT_STATE_DIR")
+    saved_env = {k: os.environ.get(k) for k in env_keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            corpus = root / "timeline"
+            corpus.mkdir()
+            (corpus / "2026-10-01.md").write_text(
+                sec("阳台", "茉莉冒出三个花苞。") + sec("面包店", "楼下面包店周三休息。")
+                + sec("天文镜", "阁楼的天文镜修好了。"), encoding="utf-8")
+            (root / "事实库").mkdir()
+            os.environ["LATENT_PASSIVE_FACTS"] = str(root / "事实库")
+            os.environ["LATENT_PASSIVE_FACT_STATE_DIR"] = str(root / "state")
+            provider = FakeProvider()
+            source_dirs, real_loader = make_corpus_loader(corpus, embed=True, provider=provider)
+            gate, calls = threading.Event(), {"loader": 0, "reload": 0}
+            read_done = threading.Event()
+
+            def loader():
+                calls["loader"] += 1
+                index = real_loader()        # 先读完语料，再停在闸门上：判据 6 要“读完之后才改”
+                read_done.set()
+                assert gate.wait(60), "自检夹具：闸门 60 秒没放行"
+                return index
+
+            real_reload = MemoryServer._reload_from_disk
+
+            def counting_reload(self):
+                calls["reload"] += 1
+                return real_reload(self)
+            MemoryServer._reload_from_disk = counting_reload
+            srv = MemoryServer(index=None, defer_index=True, fact_provider=provider,
+                               thread_store=ThreadStore(), corpus_dir=corpus,
+                               source_dirs=source_dirs, loader=loader,
+                               retractions_path=corpus / ".retractions.json",
+                               supersessions_path=corpus / ".supersessions.json",
+                               weights_path=corpus / ".weights.json",
+                               entities_path=corpus / ".entities.json",
+                               enable_passive_recall=True)
+            # 判据 7（加载中）：构造期事实索引就带着提供方，不靠主索引
+            assert srv.passive.fact_index is not None and srv.passive.fact_index.provider is provider, \
+                "判据 7：加载中事实索引的提供方必须已经是 fake，不是 None"
+            from admin_api import AdminAPI
+            admin = AdminAPI(srv, fact_path=root / "事实库")
+            httpd = make_http_server(srv, host="127.0.0.1", port=0, external_debounce=0,
+                                     admin=admin, admin_token="adm-token")
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+            hook = {"Authorization": "Bearer adm-token"}
+
+            def rpc(method, params=None, mid=1):
+                body = json.dumps({"jsonrpc": "2.0", "id": mid, "method": method,
+                                   "params": params or {}}).encode("utf-8")
+                rq = urllib.request.Request(base_url + "/mcp", data=body, headers={
+                    "Content-Type": "application/json", "Accept": "application/json"})
+                started = time.monotonic()
+                with urllib.request.urlopen(rq, timeout=10) as r:
+                    return r.status, json.loads(r.read().decode("utf-8")), time.monotonic() - started
+
+            def call(name, args):
+                return rpc("tools/call", {"name": name, "arguments": args})
+
+            def files():
+                return sorted(str(p.relative_to(root)) for p in root.rglob("*")
+                              if p.is_file() and ".embed_cache" not in p.name)
+            try:
+                srv.start_background_load()
+                assert read_done.wait(30), "自检夹具：后台线程没去读语料"
+                assert srv.loading, "夹具：loader 卡住时应处在加载中"
+                # 判据 1
+                for method in ("initialize", "tools/list"):
+                    code, resp, took = rpc(method, {"protocolVersion": PROTOCOL_VERSION,
+                                                    "capabilities": {}, "clientInfo": {"name": "t"}}
+                                           if method == "initialize" else None)
+                    assert code == 200 and "error" not in resp and took < 2, (method, code, resp, took)
+                loading_tools = sorted(t["name"] for t in rpc("tools/list")[1]["result"]["tools"])
+                # 判据 2、3
+                for name, args in (("latent_search", {"query": "天文镜"}),
+                                   ("latent_session_start", {}),
+                                   ("latent_append", {"text": "加载中不该写进去的一句话"})):
+                    code, resp, took = call(name, args)
+                    result = resp["result"]
+                    assert code == 200 and result["isError"] is True and took < 2 \
+                        and "索引还在建" in result["content"][0]["text"], (name, code, resp, took)
+                code, resp, _ = call(PASSIVE_RECALL_TOOL, {})
+                assert code == 200 and resp.get("error", {}).get("code") == E_METHOD_NOT_FOUND, \
+                    "没带宿主凭证的普通调用仍是“未知工具”，加载中也不许露出入口存在"
+                before = files()
+                call("latent_append", {"text": "加载中不该写进去的一句话"})
+                assert files() == before, f"判据 3：加载中写工具拒绝后盘上不许有新文件：{before} → {files()}"
+                # 判据 9
+                try:
+                    urllib.request.urlopen(urllib.request.Request(
+                        base_url + "/admin/api/days", headers=hook), timeout=10)
+                    raise AssertionError("判据 9：加载中页面口子应回 503")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 503 and "索引还在建" in json.loads(e.read().decode("utf-8"))["error"]
+                # 判据 6：读完之后新写一个文件
+                (corpus / "2026-10-02.md").write_text(sec("鱼缸", "新养的孔雀鱼产了第一窝。"),
+                                                      encoding="utf-8")
+                # 判据 5：放行前（整个加载期间）loader 只被调过 1 次、没有任何整库重读
+                assert calls == {"loader": 1, "reload": 0}, f"判据 5：加载中只许建一份：{calls}"
+                gate.set()
+                deadline = time.monotonic() + 10
+                while srv.loading and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                assert not srv.loading, "判据 4：放行后 10 秒内 loading 应放下"
+                # 判据 4、6
+                code, resp, _ = call("latent_search", {"query": "天文镜修好了", "topN": 3})
+                result = resp["result"]
+                assert not result.get("isError") and "天文镜" in result["content"][0]["text"], resp
+                code, resp, _ = call("latent_search", {"query": "孔雀鱼产了第一窝", "topN": 3})
+                assert "孔雀鱼" in resp["result"]["content"][0]["text"], \
+                    "判据 6：加载中改的语料，放行后下一个请求必须能搜到"
+                assert sorted(t["name"] for t in rpc("tools/list")[1]["result"]["tools"]) == loading_tools, \
+                    "判据 1：tools/list 加载中与加载后必须逐项相同"
+                # 判据 5、7（放行后）
+                # 放行后那条新文件走既有的外部同步：3 块的小夹具上新增 1 块就过校准阈值、会整库重读一次，
+                # 这是既有行为（外部同步卡），不是后台加载引起的；每次重读恰好带一次 loader。
+                assert calls["loader"] == 1 + calls["reload"] and calls["reload"] <= 1, \
+                    f"判据 5：放行后 loader 次数只能来自既有的校准重读：{calls}"
+                assert srv.index.provider.id == provider.id \
+                    and srv.passive.fact_index.provider.id == srv.index.provider.id, \
+                    "判据 7：事实索引提供方应与主索引一致"
+                # 判据 8（MemoryServer 层）：假 loader 抛异常
+                srv2 = MemoryServer(index=None, defer_index=True, thread_store=ThreadStore(),
+                                    corpus_dir=corpus, source_dirs=source_dirs,
+                                    loader=lambda: (_ for _ in ()).throw(OSError("selftest 假故障")))
+                seen = []
+                srv2.start_background_load(on_error=seen.append).join(10)
+                assert not srv2.loading and srv2.index is None and len(seen) == 1 \
+                    and isinstance(seen[0], OSError), "判据 8：失败后 loading 放下、index 置空、on_error 恰好一次"
+            finally:
+                httpd.shutdown()
+                MemoryServer._reload_from_disk = real_reload
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("selftest HTTP 先握手后建索引：通过（loader 卡住时 initialize／tools/list 各 <2 秒回 200 且工具表与加载后逐项相同；"
+          "读写工具回 isError「索引还在建」、写后盘上零新文件、宿主入口对普通凭证仍是未知工具；页面口子 503；"
+          "放行后可查、加载中改的语料可查、加载期间 loader 恰好 1 次、重读 0 次；事实提供方加载中已就位且与主索引一致；"
+          f"加载失败 loading 放下 index 置空。采集条件：Event 闸门、假 8 维向量、Python {platform.python_version()} {platform.system()}）")
+
+
 def _selftest_external_changes(now=1_800_000_000.0):
     """外部同步卡（判据见卡第四节）：常驻 HTTP 发现外部改了语料（推送器、云端经 git 同步），
     按文件比对切块结果增量换块，不整库重读。
@@ -4900,6 +5140,7 @@ def _selftest():
     _selftest_status_ops_no_rebuild()
     _selftest_incremental_writes()
     _selftest_external_changes()
+    _selftest_http_deferred_load()
     _selftest_no_hit_wording()
     now = 1_800_000_000.0
     srv = _build_server(now)
@@ -7625,7 +7866,8 @@ def _selftest():
         _only21(call21["result"]["content"][0]["text"], 1)
         assert code21d != 0, "壳退出时仍要非零——它不是一个能干活的服务"
 
-        #    e) 表里第 4 条：慢的时候有话说（靶心四：**只提示，不动加载时序**）。
+        #    e) 表里第 4 条：慢的时候有话说（靶心四：stdio **只提示，不动加载时序**；--http 另见
+        #       `_selftest_http_deferred_load`）。
         #       ⚠ 这条走函数级夹具而不是真进程：真造一份"大到会慢"的语料，
         #       跑一次要按分钟计，且多大会咬本来就没量过（任务卡第一节末那条）。
         buf21, old21 = io.StringIO(), sys.stderr
@@ -8281,14 +8523,18 @@ if __name__ == "__main__":
         # 退出码给自动化用：有 ✗ 就非零，⚠ 不算失败（那些是"能用但会悄悄变差"）
         sys.exit(1 if any(c["level"] == FAIL for c in checks) else 0)
     elif args.corpus:
-        # 慢的时候要有话说（第 4 条）：只加提示，不动加载时序（靶心四）
-        _load_done = slow_load_notice()
+        # 慢的时候要有话说（第 4 条）：stdio 只加提示，不动加载时序（靶心四）。
+        # --http 例外（任务卡「HTTP 启动先握手后建索引」）：先开端口，真索引后台建，建好前工具回“还在建”。
+        # stdio 握手走 stdout、客户端按进程起，不适用。
+        _defer = bool(args.http)
+        _load_done = slow_load_notice() if not _defer else (lambda: None)
         try:
+            _provider = resolve_provider(args.embed_provider) if args.embed else None
             source_dirs, loader = make_corpus_loader(
                 args.corpus, index_dir=args.index_dir, embed=args.embed,
-                provider=(resolve_provider(args.embed_provider)
-                          if args.embed else None))
-            srv = MemoryServer(index=loader(),
+                provider=_provider)
+            srv = MemoryServer(index=None if _defer else loader(),
+                               defer_index=_defer, fact_provider=_provider,
                                thread_store=ThreadStore(args.threads),
                                corpus_dir=args.corpus,
                                weights_path=Path(args.corpus) / ".weights.json",
@@ -8347,6 +8593,17 @@ if __name__ == "__main__":
             # 起动横幅进 stderr（stdio 传输里 stdout 是协议流，这里沿用习惯）
             hidden_note = ("仅宿主凭证可见" if hook_token else
                            "对所有凭证关闭（fail-closed：没配 --hook-token，宿主 hook 自己也用不了）")
+            def _background_load_failed(exc):
+                # 首次加载失败与改动前一样：给人话、落盘、非零退出（该拒还是拒，不降级成
+                # “端口开着永远 503”）。后台线程里 sys.exit 只会结束线程，所以走 os._exit。
+                path = write_startup_log(
+                    startup_failure_report("load", exc, embed=args.embed, http_bind=args.http), exc)
+                print(startup_failure_report("load", exc, embed=args.embed,
+                                             http_bind=args.http, log_path=path), file=sys.stderr)
+                sys.stderr.flush()
+                os._exit(1)
+            srv.start_background_load(on_error=_background_load_failed)
+            print("索引在后台建：握手已经可用，建好之前工具调用会回“索引还在建”。", file=sys.stderr)
             print(f"Streamable HTTP 服务在 http://{host}:{httpd.server_address[1]} "
                   f"（鉴权：{'Bearer token' if token else '无——仅限回环+外层反代'}；"
                   f"隐藏入口：{hidden_note}；"
