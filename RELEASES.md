@@ -2,6 +2,12 @@
 
 这里记录公开版本对用户可见的变化。内部任务史、私人复测记录和未发布实验不写进本文件。
 
+## 2026-10-23
+
+### 文档
+
+- 《快速上手》§5 补 Android（proot）上用本地模型的两个环境变量：连不上 huggingface.co 时设 `HF_ENDPOINT` 走镜像；`FASTEMBED_CACHE_PATH` 指向持久目录，免得 `/tmp` 被清后每次重启重新下模型，下好后可加 `HF_HUB_OFFLINE=1`。依据是一份外部部署记录（Operit／Android 15／proot Ubuntu 24.04／aarch64），本项目未复现。
+
 ## 2026-10-22
 
 ### 变化
